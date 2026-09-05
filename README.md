@@ -147,6 +147,4 @@ prompt-injection sanitization layer. No live API calls or keys required.
 
 ## License
 
-*(add a license if you want one — MIT is a common, permissive default for
-portfolio projects; GitHub can generate one for you under Settings → General
-→ "Add a license" if you'd like)*
+MIT License — see [LICENSE](LICENSE) for details.
