@@ -3,22 +3,21 @@
 # Imports from sources.py and scoring.py ONLY. Never the reverse.
 # Never hardcodes source names in the orchestration loop.
 
+from dotenv import load_dotenv
+from pathlib import Path
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+
 import os
 import re
 import time
 import ipaddress
 from urllib.parse import urlparse
-from pathlib import Path
 
 import streamlit as st
-from dotenv import load_dotenv
 
 from sources import SOURCES
 from scoring import score_evidence
 from cache import get_cached_result, set_cached_result, cache_age_seconds
-
-
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 st.set_page_config(page_title="ThreatLens", page_icon="🔎", layout="wide")
 
@@ -105,7 +104,7 @@ def validate_target(target: str, target_type: str):
 
 
 # ---------------------------------------------------------------------------
-# Orchestration (unchanged logic)
+# Orchestration
 # ---------------------------------------------------------------------------
 
 
@@ -122,6 +121,7 @@ def collect_results(target: str, target_type: str) -> dict:
             }
     return results
 
+
 def sanitize_evidence_for_prompt(results: dict) -> str:
     """
     Prepares evidence data for safe inclusion in the Gemini prompt.
@@ -137,10 +137,6 @@ def sanitize_evidence_for_prompt(results: dict) -> str:
     """
     import json
 
-    # Characters/sequences commonly used in injection attempts to simulate
-    # a new instruction block or role change. Strip rather than escape, since
-    # we want them gone, not preserved-but-neutered (escaping can itself be
-    # a vector if the model "unescapes" mentally).
     injection_markers = [
         "ignore previous instructions",
         "ignore all previous instructions",
@@ -153,8 +149,6 @@ def sanitize_evidence_for_prompt(results: dict) -> str:
         if isinstance(value, str):
             cleaned = value
             for marker in injection_markers:
-                # Case-insensitive removal
-                import re
                 cleaned = re.sub(re.escape(marker), "[redacted]", cleaned, flags=re.IGNORECASE)
             return cleaned
         elif isinstance(value, dict):
@@ -165,9 +159,6 @@ def sanitize_evidence_for_prompt(results: dict) -> str:
 
     cleaned_results = clean_value(results)
 
-    # Serialize as JSON (not Python repr) — JSON's strict quoting makes it
-    # much harder for embedded text to visually "escape" the data block than
-    # Python dict string formatting does.
     return json.dumps(cleaned_results, indent=2, default=str)
 
 
@@ -234,12 +225,14 @@ def call_gemini(prompt: str) -> dict:
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
-        
         # Pinned to a specific stable version (not "-latest") for reproducible behavior.
         # Google periodically retires old models — if this 404s in the future, check
         # available models with genai.list_models() and update this string.
         model = genai.GenerativeModel("gemini-3.6-flash")
-        response = model.generate_content(prompt)
+        response = model.generate_content(
+            prompt,
+            request_options={"timeout": 15},
+        )
         return parse_gemini_response(response.text)
     except Exception as exc:
         return {
@@ -284,191 +277,114 @@ with st.form("scan_form"):
         level = st.selectbox("Knowledge level", ["Beginner", "Intermediate", "Expert"])
     force_fresh = st.checkbox("Force fresh scan (ignore cache)", value=False)
     submitted = st.form_submit_button("🔍 Scan", use_container_width=True)
+
 if submitted:
     error = validate_target(target, target_type)
-
     if error:
         st.error(f"**Invalid input:** {error}")
-
     else:
-        results = {}
-        assessment = {}
-        insight = {}
+        results_placeholder = st.empty()
+        with results_placeholder.container():
+            results = {}
+            assessment = {}
+            insight = {}
 
-        cached = None if force_fresh else get_cached_result(
-            target.strip(),
-            target_type
-        )
+            cached = None if force_fresh else get_cached_result(target.strip(), target_type)
 
-        if cached:
-            age = cache_age_seconds(cached)
+            if cached:
+                age = cache_age_seconds(cached)
+                st.success(f"📦 Cached result — scanned {int(age // 60)}m {int(age % 60)}s ago. Check \"Force fresh scan\" above to re-check now.")
+                results = cached["results"]
+                assessment = cached["assessment"]
+                insight = cached["insight"]
+            else:
+                with st.status("Running analysis...", expanded=True) as status:
+                    st.write("📡 Collecting intelligence from VirusTotal + WHOIS...")
+                    results = collect_results(target.strip(), target_type)
 
-            st.success(
-                f"📦 Cached result — scanned "
-                f"{int(age // 60)}m {int(age % 60)}s ago. "
-                f'Check "Force fresh scan" above to re-check now.'
+                    st.write("🧮 Scoring evidence deterministically...")
+                    assessment = score_evidence(target.strip(), target_type, results)
+
+                    st.write("🤖 Generating AI interpretation...")
+                    st.caption("This can take 10-30+ seconds on the free tier — not frozen, Gemini is just slow to respond.")
+                    prompt = build_gemini_prompt(target.strip(), target_type, level, results, assessment)
+
+                    gemini_start = time.time()
+                    insight = call_gemini(prompt)
+                    gemini_elapsed = time.time() - gemini_start
+
+                    st.write(f"✅ AI step finished in {gemini_elapsed:.1f}s")
+                    status.update(label="Analysis complete", state="complete", expanded=False)
+
+                # Don't cache a failed Gemini call — a transient error shouldn't get "stuck"
+                # for the full TTL. Scoring/evidence still gets reused; only skip caching when
+                # the specific run had a real AI failure (not demo mode, which is expected).
+                if not insight.get("demo") and "failed" not in insight.get("SUMMARY", "").lower():
+                    set_cached_result(target.strip(), target_type, results, assessment, insight)
+
+            # --- Demo mode banner ---
+            if assessment["evidence_quality"]["demo_sources"]:
+                st.info(
+                    f"ℹ️ Running with demo data for: **{', '.join(assessment['evidence_quality']['demo_sources'])}** "
+                    "(no API key configured — this lowers confidence)."
+                )
+
+            # --- Verdict header ---
+            color = VERDICT_COLORS.get(assessment["verdict"], VERDICT_COLORS["UNKNOWN"])
+            icon = VERDICT_ICONS.get(assessment["verdict"], "❔")
+            st.markdown(
+                f"""<div class="verdict-banner" style="background-color:{color};">
+                <h2>{icon} Verdict: {assessment['verdict']}</h2>
+                </div>""",
+                unsafe_allow_html=True,
             )
 
-            results = cached["results"]
-            assessment = cached["assessment"]
-            insight = cached["insight"]
-
-        else:
-            with st.status(
-                "Running analysis...",
-                expanded=True
-            ) as status:
-
-                st.write(
-                    "📡 Collecting intelligence from VirusTotal + WHOIS..."
-                )
-
-                results = collect_results(
-                    target.strip(),
-                    target_type
-                )
-
-                st.write(
-                    "🧮 Scoring evidence deterministically..."
-                )
-
-                assessment = score_evidence(
-                    target.strip(),
-                    target_type,
-                    results
-                )
-
-                st.write(
-                    "🤖 Generating AI interpretation..."
-                )
-
-                st.caption(
-                    "This can take 10-30+ seconds on the free tier — "
-                    "not frozen, Gemini is just slow to respond."
-                )
-
-                prompt = build_gemini_prompt(
-                    target.strip(),
-                    target_type,
-                    level,
-                    results,
-                    assessment
-                )
-
-                gemini_start = time.time()
-
-                insight = call_gemini(prompt)
-
-                gemini_elapsed = time.time() - gemini_start
-
-                st.write(
-                    f"✅ AI step finished in {gemini_elapsed:.1f}s"
-                )
-
-                status.update(
-                    label="Analysis complete",
-                    state="complete",
-                    expanded=False
-                )
-
-                        # Don't cache a failed Gemini call — a transient error shouldn't get "stuck"
-            # for the full TTL. Scoring/evidence still gets reused; only skip caching when
-            # the specific run had a real AI failure (not demo mode, which is expected).
-            if not insight.get("demo") and "failed" not in insight.get("SUMMARY", "").lower():
-                set_cached_result(target.strip(), target_type, results, assessment, insight)
-
-        cached = None if force_fresh else get_cached_result(target.strip(), target_type)
-
-        if cached:
-            age = cache_age_seconds(cached)
-            st.success(f"📦 Cached result — scanned {int(age // 60)}m {int(age % 60)}s ago. Check \"Force fresh scan\" above to re-check now.")
-            results = cached["results"]
-            assessment = cached["assessment"]
-            insight = cached["insight"]
-        else:
-            with st.status("Running analysis...", expanded=True) as status:
-                st.write("📡 Collecting intelligence from VirusTotal + WHOIS...")
-                results = collect_results(target.strip(), target_type)
-
-                st.write("🧮 Scoring evidence deterministically...")
-                assessment = score_evidence(target.strip(), target_type, results)
-
-                st.write("🤖 Generating AI interpretation...")
-                st.caption("This can take 10-30+ seconds on the free tier — not frozen, Gemini is just slow to respond.")
-                prompt = build_gemini_prompt(target.strip(), target_type, level, results, assessment)
-
-                gemini_start = time.time()
-                insight = call_gemini(prompt)
-                gemini_elapsed = time.time() - gemini_start
-
-                st.write(f"✅ AI step finished in {gemini_elapsed:.1f}s")
-                status.update(label="Analysis complete", state="complete", expanded=False)
-
-            set_cached_result(target.strip(), target_type, results, assessment, insight)
-            
-        # --- Demo mode banner ---
-        if assessment["evidence_quality"]["demo_sources"]:
-            st.info(
-                f"ℹ️ Running with demo data for: **{', '.join(assessment['evidence_quality']['demo_sources'])}** "
-                "(no API key configured — this lowers confidence)."
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Threat Score", f"{assessment['score']}/100")
+            m2.metric("Risk Level", assessment["risk_level"])
+            m3.metric("Confidence", assessment["confidence"])
+            m4.metric(
+                "Sources Used",
+                f"{assessment['evidence_quality']['usable_sources']}/{assessment['evidence_quality']['total_sources']}",
             )
 
-        # --- Verdict header ---
-        color = VERDICT_COLORS.get(assessment["verdict"], VERDICT_COLORS["UNKNOWN"])
-        icon = VERDICT_ICONS.get(assessment["verdict"], "❔")
-        st.markdown(
-            f"""<div class="verdict-banner" style="background-color:{color};">
-            <h2>{icon} Verdict: {assessment['verdict']}</h2>
-            </div>""",
-            unsafe_allow_html=True,
-        )
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Threat Score", f"{assessment['score']}/100")
-        m2.metric("Risk Level", assessment["risk_level"])
-        m3.metric("Confidence", assessment["confidence"])
-        m4.metric(
-            "Sources Used",
-            f"{assessment['evidence_quality']['usable_sources']}/{assessment['evidence_quality']['total_sources']}",
-        )
-
-        # --- Source status badges ---
-        badge_html = ""
-        for name, result in results.items():
-            dot = STATUS_BADGE.get(result["status"], "⚪")
-            badge_html += f'<span class="source-badge">{dot} {name}</span>'
-        st.markdown(badge_html, unsafe_allow_html=True)
-
-        st.divider()
-
-        # --- Two-column layout: scoring reasons | AI interpretation ---
-        left, right = st.columns(2)
-
-        with left:
-            st.subheader("📊 Why this score")
-            for reason in assessment["reasons"]:
-                st.markdown(f'<div class="reason-item">• {reason}</div>', unsafe_allow_html=True)
-
-        with right:
-            st.subheader("🤖 AI Interpretation")
-            if insight.get("demo"):
-                st.caption("⚠️ Demo mode — no GEMINI_API_KEY set, this is a placeholder, not a real AI analysis.")
-            st.markdown(f"**Summary:** {insight['SUMMARY']}")
-            st.markdown(f"**Key findings:**\n{insight['KEY_FINDINGS']}")
-            st.markdown(f"**Recommendation:** {insight['RECOMMENDATION']}")
-
-        st.divider()
-
-        # --- Raw evidence ---
-        st.subheader("🗂️ Raw Source Data")
-        cols = st.columns(len(results)) if results else []
-        for col, (name, result) in zip(cols, results.items()):
-            with col:
+            # --- Source status badges ---
+            badge_html = ""
+            for name, result in results.items():
                 dot = STATUS_BADGE.get(result["status"], "⚪")
-                with st.expander(f"{dot} {name}", expanded=False):
-                    if result["status"] == "ok":
-                        st.json(result["data"])
-                    else:
-                        st.error(result["error"])
+                badge_html += f'<span class="source-badge">{dot} {name}</span>'
+            st.markdown(badge_html, unsafe_allow_html=True)
+
+            st.divider()
+
+            # --- Two-column layout: scoring reasons | AI interpretation ---
+            left, right = st.columns(2)
+
+            with left:
+                st.subheader("📊 Why this score")
+                for reason in assessment["reasons"]:
+                    st.markdown(f'<div class="reason-item">• {reason}</div>', unsafe_allow_html=True)
+
+            with right:
+                st.subheader("🤖 AI Interpretation")
+                if insight.get("demo"):
+                    st.caption("⚠️ Demo mode — no GEMINI_API_KEY set, this is a placeholder, not a real AI analysis.")
+                st.markdown(f"**Summary:** {insight['SUMMARY']}")
+                st.markdown(f"**Key findings:**\n{insight['KEY_FINDINGS']}")
+                st.markdown(f"**Recommendation:** {insight['RECOMMENDATION']}")
+
+            st.divider()
+
+            # --- Raw evidence ---
+            st.subheader("🗂️ Raw Source Data")
+            cols = st.columns(len(results)) if results else []
+            for col, (name, result) in zip(cols, results.items()):
+                with col:
+                    dot = STATUS_BADGE.get(result["status"], "⚪")
+                    with st.expander(f"{dot} {name}", expanded=False):
+                        if result["status"] == "ok":
+                            st.json(result["data"])
+                        else:
+                            st.error(result["error"])
 else:
     st.info("👆 Enter a target above and click **Scan** to begin analysis.")
