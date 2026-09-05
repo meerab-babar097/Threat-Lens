@@ -1,0 +1,6 @@
+streamlit
+requests
+python-whois
+google-generativeai
+python-dotenv
+pytest
