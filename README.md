@@ -27,9 +27,7 @@ confidence are all computed independently of the AI layer.
 
 ## Screenshot
 
-*(add a screenshot of the app here once you have one — drag an image into
-this README.md file on GitHub's web editor, or reference a file you commit
-under a `docs/` or `screenshots/` folder)*
+![ThreatLens dashboard](screenshot.png)
 
 ## Features
 
