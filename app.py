@@ -19,6 +19,7 @@ from sources import SOURCES
 from scoring import score_evidence
 from cache import get_cached_result, set_cached_result, cache_age_seconds
 from history import init_db, log_scan, get_recent_scans
+from report import generate_report_pdf
 
 init_db()
 
@@ -379,7 +380,7 @@ if submitted:
 
             st.divider()
 
-            # --- Raw evidence ---
+                        # --- Raw evidence ---
             st.subheader("🗂️ Raw Source Data")
             cols = st.columns(len(results)) if results else []
             for col, (name, result) in zip(cols, results.items()):
@@ -390,6 +391,20 @@ if submitted:
                             st.json(result["data"])
                         else:
                             st.error(result["error"])
+
+            # --- PDF download ---
+            st.divider()
+            pdf_bytes = generate_report_pdf(
+                target.strip(), target_type, level, time.time(), assessment, insight, results
+            )
+            st.download_button(
+                "⬇️ Download PDF Report",
+                data=pdf_bytes,
+                file_name=f"threatlens_{target.strip().replace('.', '_')}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
 else:
     st.info("👆 Enter a target above and click **Scan** to begin analysis.")
 
@@ -419,4 +434,19 @@ else:
 
             import json
             insight_data = json.loads(scan["insight_json"])
+            assessment_data = json.loads(scan["assessment_json"])
+            results_data = json.loads(scan["results_json"])
             st.markdown(f"**Summary:** {insight_data.get('SUMMARY', 'N/A')}")
+
+            history_pdf_bytes = generate_report_pdf(
+                scan["target"], scan["target_type"], scan["knowledge_level"],
+                scan["scanned_at"], assessment_data, insight_data, results_data,
+            )
+            st.download_button(
+                "⬇️ Download PDF Report",
+                data=history_pdf_bytes,
+                file_name=f"threatlens_{scan['target'].replace('.', '_')}_{scan['id']}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key=f"pdf_download_{scan['id']}",
+            )

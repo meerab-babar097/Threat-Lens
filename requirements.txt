@@ -4,3 +4,4 @@ python-whois
 google-generativeai
 python-dotenv
 pytest
+fpdf2
