@@ -18,6 +18,9 @@ import streamlit as st
 from sources import SOURCES
 from scoring import score_evidence
 from cache import get_cached_result, set_cached_result, cache_age_seconds
+from history import init_db, log_scan, get_recent_scans
+
+init_db()
 
 st.set_page_config(page_title="ThreatLens", page_icon="🔎", layout="wide")
 
@@ -321,6 +324,7 @@ if submitted:
                 # the specific run had a real AI failure (not demo mode, which is expected).
                 if not insight.get("demo") and "failed" not in insight.get("SUMMARY", "").lower():
                     set_cached_result(target.strip(), target_type, results, assessment, insight)
+            log_scan(target.strip(), target_type, level, results, assessment, insight)
 
             # --- Demo mode banner ---
             if assessment["evidence_quality"]["demo_sources"]:
@@ -388,3 +392,31 @@ if submitted:
                             st.error(result["error"])
 else:
     st.info("👆 Enter a target above and click **Scan** to begin analysis.")
+
+
+# ---------------------------------------------------------------------------
+# Recent Scans History
+# ---------------------------------------------------------------------------
+
+st.divider()
+st.subheader("📜 Recent Scans")
+
+recent = get_recent_scans(limit=10)
+
+if not recent:
+    st.caption("No scans yet — run your first scan above to start building history.")
+else:
+    for scan in recent:
+        import datetime
+        scanned_time = datetime.datetime.fromtimestamp(scan["scanned_at"]).strftime("%Y-%m-%d %H:%M")
+        icon = VERDICT_ICONS.get(scan["verdict"], "❔")
+
+        with st.expander(f"{icon} {scan['target']} ({scan['target_type']}) — {scan['verdict']}, {scan['score']}/100 — {scanned_time}"):
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Score", f"{scan['score']}/100")
+            col2.metric("Risk", scan["risk_level"])
+            col3.metric("Confidence", scan["confidence"])
+
+            import json
+            insight_data = json.loads(scan["insight_json"])
+            st.markdown(f"**Summary:** {insight_data.get('SUMMARY', 'N/A')}")
